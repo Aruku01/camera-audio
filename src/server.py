@@ -30,9 +30,11 @@ def generate_frames():
         frame = picam2.capture_array()
         results = pose.process(frame)
 
-        # BGRに変換（OpenCV描画用）
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
+        # RGBのままJPEGにエンコード
+        frame_draw = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
+        b, g, r = cv2.split(frame_draw)
+        frame_bgr = cv2.merge([r, g, b])
+        
         if results.pose_landmarks:
             # 骨格を描画
             mp.solutions.drawing_utils.draw_landmarks(
