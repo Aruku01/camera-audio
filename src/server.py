@@ -19,25 +19,27 @@ time.sleep(2)
 
 def generate_frames():
     while True:
+        # picamera2のRGB888はメモリ上BGR順で渡されるため、
+        # MediaPipe用にBGR→RGBへ変換し、表示用はそのまま使う
         frame = picam2.capture_array()
-        results, text, landed = detect(frame)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        results, text, landed = detect(frame_rgb)
 
         for side in landed:
             play(side)
 
-        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-
+        display = frame.copy()
         if results.pose_landmarks:
             mp.solutions.drawing_utils.draw_landmarks(
-                frame_bgr,
+                display,
                 results.pose_landmarks,
                 mp_pose.POSE_CONNECTIONS
             )
 
-        cv2.putText(frame_bgr, text, (10, 30),
+        cv2.putText(display, text, (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-        _, buffer = cv2.imencode('.jpg', frame_bgr)
+        _, buffer = cv2.imencode('.jpg', display)
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
 
