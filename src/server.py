@@ -5,6 +5,7 @@ from picamera2 import Picamera2
 from detection import detect, get_status, mp_pose, _state, _ground_y, _air_min_y
 from audio import play
 from led import flash
+from threading import Thread, Lock
 import time
 
 app = Flask(__name__)
@@ -17,13 +18,21 @@ picam2.configure(config)
 picam2.start()
 time.sleep(2)
 
+# MediaPipe推論解像度（表示は640x480のまま、正規化座標なので描画に影響なし）
+DETECT_SIZE = (320, 240)
+JPEG_QUALITY = 70
 
-def generate_frames():
+_latest_jpeg = None
+_jpeg_lock = Lock()
+
+
+def _detection_loop():
+    global _latest_jpeg
     while True:
-        # picamera2のRGB888はメモリ上BGR順で渡されるため、
-        # MediaPipe用にBGR→RGBへ変換し、表示用はそのまま使う
-        frame = picam2.capture_array()
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame = picam2.capture_array()  # BGR 640x480
+
+        small = cv2.resize(frame, DETECT_SIZE)
+        frame_rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         results, text, landed = detect(frame_rgb)
 
         for side in landed:
@@ -34,27 +43,39 @@ def generate_frames():
         display = frame.copy()
         if results.pose_landmarks:
             mp.solutions.drawing_utils.draw_landmarks(
-                display,
-                results.pose_landmarks,
-                mp_pose.POSE_CONNECTIONS
+                display, results.pose_landmarks, mp_pose.POSE_CONNECTIONS
             )
 
         cv2.putText(display, text, (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
-        # デバッグ: 各足首のY値と状態を表示
         for i, (side, label) in enumerate([('L', 'Left'), ('R', 'Right')]):
             gy = _ground_y[side]
-            ay = _air_min_y[side]
             st = _state[side]
             gy_str = f"{gy:.2f}" if gy is not None else "--"
-            dbg = f"{label}: state={st} gnd={gy_str} air={ay:.2f}"
+            dbg = f"{label}: {st} gnd={gy_str} air={_air_min_y[side]:.2f}"
             cv2.putText(display, dbg, (10, 60 + i * 25),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
 
-        _, buffer = cv2.imencode('.jpg', display)
+        _, buf = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+        with _jpeg_lock:
+            _latest_jpeg = buf.tobytes()
+
+
+Thread(target=_detection_loop, daemon=True).start()
+
+
+def generate_frames():
+    last_sent = None
+    while True:
+        with _jpeg_lock:
+            jpeg = _latest_jpeg
+        if jpeg is None or jpeg is last_sent:
+            time.sleep(0.01)
+            continue
+        last_sent = jpeg
         yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+               b'Content-Type: image/jpeg\r\n\r\n' + jpeg + b'\r\n')
 
 
 @app.route('/')

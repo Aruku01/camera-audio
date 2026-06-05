@@ -12,7 +12,7 @@ SMOOTH_N = 5             # Y値の平均化フレーム数
 
 pose = mp_pose.Pose(
     static_image_mode=False,
-    model_complexity=2,       # 最高精度モデル
+    model_complexity=1,
     smooth_landmarks=True,
     min_detection_confidence=0.5,
     min_tracking_confidence=0.5,
