@@ -7,13 +7,16 @@ import time
 mp_pose = mp.solutions.pose
 
 # ── チューニング定数 ────────────────────────────────────────────────────
-PEAK_MIN       = 0.006  # 「山あり」とみなす最低速度（正規化座標/フレーム）
-                        #   すり足で反応しない場合は 0.004 まで下げる
-VALLEY_THRESH  = 0.003  # この速度を下回ったら谷=接地と即判定
-                        #   PEAK_MIN より低くすること
-REFRACTORY_SEC = 0.35   # 接地イベント後の不応期（秒）
-VISIBILITY_MIN = 0.5    # ランドマーク可視性の最低値
-SMOOTH_N       = 5      # 速度移動平均フレーム数
+PEAK_MIN         = 0.006  # 「山あり」とみなす最低速度（正規化座標/フレーム）
+                          #   すり足で反応しない場合は 0.004 まで下げる
+VALLEY_THRESH    = 0.003  # この速度を下回ったら谷=接地と即判定
+                          #   PEAK_MIN より低くすること
+VALLEY_DROP_RATIO = 0.5   # 変曲点による谷判定の条件：
+                          #   peak_spd * VALLEY_DROP_RATIO まで下がってから
+                          #   上昇に転じた場合のみ発火（微小なギザギザを無視）
+REFRACTORY_SEC   = 0.5    # 接地イベント後の不応期（秒）
+VISIBILITY_MIN   = 0.5    # ランドマーク可視性の最低値
+SMOOTH_N         = 5      # 速度移動平均フレーム数
 # ────────────────────────────────────────────────────────────────────────
 
 pose = mp_pose.Pose(
@@ -44,12 +47,14 @@ _speed_buf    = {'L': deque(maxlen=SMOOTH_N), 'R': deque(maxlen=SMOOTH_N)}
 # 状態: 'SEEK_PEAK'(山待ち) | 'SEEK_VALLEY'(谷待ち)
 _state        = {'L': 'SEEK_PEAK', 'R': 'SEEK_PEAK'}
 _prev_spd     = {'L': 0.0, 'R': 0.0}     # SEEK_VALLEY 中の前フレーム速度
+_peak_spd     = {'L': 0.0, 'R': 0.0}     # SEEK_VALLEY 中に観測した最大速度
 _descending   = {'L': False, 'R': False}  # 速度が下降中か
 _last_contact = {'L': 0.0, 'R': 0.0}
 
 # server.py からインポートしてデバッグ表示に使う
 debug = {
     'speed':      {'L': 0.0, 'R': 0.0},
+    'peak_spd':   {'L': 0.0, 'R': 0.0},
     'descending': {'L': False, 'R': False},
 }
 
@@ -107,22 +112,29 @@ def detect(frame):
         for side in ('L', 'R'):
             raw = _foot_speed(side, lm)
             spd = _smooth(side, raw)
-            debug['speed'][side] = spd
 
             if _state[side] == 'SEEK_PEAK':
                 if spd >= PEAK_MIN:
                     _state[side]      = 'SEEK_VALLEY'
                     _prev_spd[side]   = spd
+                    _peak_spd[side]   = spd
                     _descending[side] = False
 
             else:  # SEEK_VALLEY
+                # SEEK_VALLEY 中の最大速度を更新
+                if spd > _peak_spd[side]:
+                    _peak_spd[side] = spd
+
                 # 速度が前フレームより下がっていたら「下降中」フラグを立てる
                 if spd < _prev_spd[side]:
                     _descending[side] = True
 
                 # 谷の判定（どちらか一方で発火）
                 valley_by_thresh  = spd < VALLEY_THRESH
-                valley_by_inflect = _descending[side] and spd > _prev_spd[side]
+                # 変曲点による谷判定：peak_spd の VALLEY_DROP_RATIO 以下まで
+                # 下がってから上昇に転じた場合のみ（微小なギザギザを無視）
+                dropped_enough    = spd <= _peak_spd[side] * VALLEY_DROP_RATIO
+                valley_by_inflect = _descending[side] and dropped_enough and spd > _prev_spd[side]
 
                 if valley_by_thresh or valley_by_inflect:
                     if now - _last_contact[side] >= REFRACTORY_SEC:
@@ -131,11 +143,13 @@ def detect(frame):
                     # 次の山を待つ状態へリセット
                     _state[side]      = 'SEEK_PEAK'
                     _prev_spd[side]   = 0.0
+                    _peak_spd[side]   = 0.0
                     _descending[side] = False
                 else:
                     _prev_spd[side] = spd
 
-            # デバッグ更新（SEEK_PEAKリセット直後は False になる）
+            debug['speed'][side]      = spd
+            debug['peak_spd'][side]   = _peak_spd[side]
             debug['descending'][side] = _descending[side]
 
         if landed:
@@ -146,12 +160,14 @@ def detect(frame):
     else:
         # 再出現時の誤速度を防ぐため前フレーム位置をクリア
         for side in ('L', 'R'):
-            _prev_pos[side]           = {lm_id: None for lm_id in _FOOT_LM[side]}
-            _state[side]              = 'SEEK_PEAK'
-            _prev_spd[side]           = 0.0
-            _descending[side]         = False
-            debug['speed'][side]      = 0.0
-            debug['descending'][side] = False
+            _prev_pos[side]             = {lm_id: None for lm_id in _FOOT_LM[side]}
+            _state[side]                = 'SEEK_PEAK'
+            _prev_spd[side]             = 0.0
+            _peak_spd[side]             = 0.0
+            _descending[side]           = False
+            debug['speed'][side]        = 0.0
+            debug['peak_spd'][side]     = 0.0
+            debug['descending'][side]   = False
         message = "人物未検出"
 
     with _lock:
