@@ -7,15 +7,13 @@ import time
 mp_pose = mp.solutions.pose
 
 # ── チューニング定数 ────────────────────────────────────────────────────
-SWING_ENTER_THRESH = 0.006  # STANCE→SWING: この速度を超えたらスイング開始
-                            #   すり足で検知しない場合は 0.004 まで下げる
-SWING_EXIT_THRESH  = 0.003  # SWING→STANCE: この速度を下回ったら接地と判定
-                            #   SWING_ENTER_THRESH より低くしてヒステリシスを作る
-MIN_SWING_DIST     = 0.02   # 1歩とみなす最小累積移動量（正規化座標）
-                            #   ノイズ除去用。すり足で弾かれる場合は 0.01 に下げる
-REFRACTORY_SEC     = 0.35   # 接地イベント後の不応期（秒）
-VISIBILITY_MIN     = 0.5    # ランドマーク可視性の最低値
-SMOOTH_N           = 5      # 速度移動平均フレーム数
+PEAK_MIN       = 0.006  # 「山あり」とみなす最低速度（正規化座標/フレーム）
+                        #   すり足で反応しない場合は 0.004 まで下げる
+VALLEY_THRESH  = 0.003  # この速度を下回ったら谷=接地と即判定
+                        #   PEAK_MIN より低くすること
+REFRACTORY_SEC = 0.35   # 接地イベント後の不応期（秒）
+VISIBILITY_MIN = 0.5    # ランドマーク可視性の最低値
+SMOOTH_N       = 5      # 速度移動平均フレーム数
 # ────────────────────────────────────────────────────────────────────────
 
 pose = mp_pose.Pose(
@@ -29,8 +27,8 @@ pose = mp_pose.Pose(
 current_status = {"message": "検出待機中..."}
 _lock = Lock()
 
-# 足ごとのランドマーク (足首・かかと・つま先)
-# すり足ではつま先が最も動くため3点の最大値を使う
+# 足ごとのランドマーク（足首・かかと・つま先）
+# すり足はつま先が最も動くため3点の最大値を使う
 _FOOT_LM = {
     'L': (mp_pose.PoseLandmark.LEFT_ANKLE,
           mp_pose.PoseLandmark.LEFT_HEEL,
@@ -42,14 +40,17 @@ _FOOT_LM = {
 
 _prev_pos     = {side: {lm: None for lm in lms} for side, lms in _FOOT_LM.items()}
 _speed_buf    = {'L': deque(maxlen=SMOOTH_N), 'R': deque(maxlen=SMOOTH_N)}
-_state        = {'L': 'STANCE', 'R': 'STANCE'}   # 'STANCE' | 'SWING'
-_swing_dist   = {'L': 0.0, 'R': 0.0}             # SWING中の累積移動量
-_last_contact = {'L': 0.0, 'R': 0.0}             # 最後の接地イベント時刻
 
-# server.py 側でデバッグ表示に使う（dictはインポート先でも変化が見える）
+# 状態: 'SEEK_PEAK'(山待ち) | 'SEEK_VALLEY'(谷待ち)
+_state        = {'L': 'SEEK_PEAK', 'R': 'SEEK_PEAK'}
+_prev_spd     = {'L': 0.0, 'R': 0.0}     # SEEK_VALLEY 中の前フレーム速度
+_descending   = {'L': False, 'R': False}  # 速度が下降中か
+_last_contact = {'L': 0.0, 'R': 0.0}
+
+# server.py からインポートしてデバッグ表示に使う
 debug = {
     'speed':      {'L': 0.0, 'R': 0.0},
-    'swing_dist': {'L': 0.0, 'R': 0.0},
+    'descending': {'L': False, 'R': False},
 }
 
 
@@ -84,12 +85,14 @@ def get_status():
 
 def detect(frame):
     """
-    各足を STANCE / SWING の2状態で管理する。
-    SWING→STANCE の遷移時に「接地イベント」を発火する（足音タイミング）。
+    各足の速度が「山→谷」を刻むたびに接地イベントを発火する。
 
-      STANCE ─[spd > SWING_ENTER_THRESH]→ SWING
-      SWING  ─[spd < SWING_EXIT_THRESH]──→ STANCE + 接地イベント
-                                            （累積移動量 >= MIN_SWING_DIST の場合のみ）
+      SEEK_PEAK  ─[spd >= PEAK_MIN]────────────────────▶ SEEK_VALLEY
+      SEEK_VALLEY ─[spd < VALLEY_THRESH                 ▶ 接地イベント + SEEK_PEAK
+                    OR (下降後に上昇へ転じた変曲点)]
+
+    連続歩行では速度が周期的に山谷を繰り返すため、1歩ごとに発火できる。
+    累積移動量ではなく瞬時速度の変化を見るためリセット漏れが起きない。
 
     戻り値: (results, message, landed)
       landed: 今フレームで接地した足のリスト ['L'], ['R'], ['L','R'], []
@@ -102,29 +105,38 @@ def detect(frame):
         now = time.time()
 
         for side in ('L', 'R'):
-            raw = _foot_speed(side, lm)   # 今フレームの生移動量（累積距離用）
-            spd = _smooth(side, raw)      # 平滑化速度（状態遷移の判定用）
+            raw = _foot_speed(side, lm)
+            spd = _smooth(side, raw)
+            debug['speed'][side] = spd
 
-            debug['speed'][side]      = spd
-            debug['swing_dist'][side] = _swing_dist[side]
+            if _state[side] == 'SEEK_PEAK':
+                if spd >= PEAK_MIN:
+                    _state[side]      = 'SEEK_VALLEY'
+                    _prev_spd[side]   = spd
+                    _descending[side] = False
 
-            if _state[side] == 'STANCE':
-                if spd > SWING_ENTER_THRESH:
-                    _state[side]      = 'SWING'
-                    _swing_dist[side] = raw   # 遷移フレームの移動量を含める
+            else:  # SEEK_VALLEY
+                # 速度が前フレームより下がっていたら「下降中」フラグを立てる
+                if spd < _prev_spd[side]:
+                    _descending[side] = True
 
-            else:  # SWING
-                _swing_dist[side] += raw      # 累積移動量を積算
+                # 谷の判定（どちらか一方で発火）
+                valley_by_thresh  = spd < VALLEY_THRESH
+                valley_by_inflect = _descending[side] and spd > _prev_spd[side]
 
-                if spd < SWING_EXIT_THRESH:
-                    # SWING→STANCE: 接地イベント判定
-                    # 累積移動量が最小距離以上 かつ 不応期を過ぎていれば発火
-                    if (_swing_dist[side] >= MIN_SWING_DIST and
-                            now - _last_contact[side] >= REFRACTORY_SEC):
+                if valley_by_thresh or valley_by_inflect:
+                    if now - _last_contact[side] >= REFRACTORY_SEC:
                         _last_contact[side] = now
                         landed.append(side)
-                    _state[side]      = 'STANCE'
-                    _swing_dist[side] = 0.0
+                    # 次の山を待つ状態へリセット
+                    _state[side]      = 'SEEK_PEAK'
+                    _prev_spd[side]   = 0.0
+                    _descending[side] = False
+                else:
+                    _prev_spd[side] = spd
+
+            # デバッグ更新（SEEK_PEAKリセット直後は False になる）
+            debug['descending'][side] = _descending[side]
 
         if landed:
             label = '・'.join('左足' if s == 'L' else '右足' for s in landed)
@@ -132,13 +144,14 @@ def detect(frame):
         else:
             message = "人物検出中"
     else:
-        # 人物未検出: 前フレーム位置をリセット（再出現時の誤速度計算を防ぐ）
+        # 再出現時の誤速度を防ぐため前フレーム位置をクリア
         for side in ('L', 'R'):
             _prev_pos[side]           = {lm_id: None for lm_id in _FOOT_LM[side]}
-            _state[side]              = 'STANCE'
-            _swing_dist[side]         = 0.0
+            _state[side]              = 'SEEK_PEAK'
+            _prev_spd[side]           = 0.0
+            _descending[side]         = False
             debug['speed'][side]      = 0.0
-            debug['swing_dist'][side] = 0.0
+            debug['descending'][side] = False
         message = "人物未検出"
 
     with _lock:

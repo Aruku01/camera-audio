@@ -50,9 +50,14 @@ def _detection_loop():
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
         for i, (side, label) in enumerate([('L', 'Left'), ('R', 'Right')]):
-            spd  = debug['speed'][side]
-            dist = debug['swing_dist'][side]
-            dbg  = f"{label}: {_state[side]}  spd={spd:.4f}  dist={dist:.3f}"
+            spd = debug['speed'][side]
+            if _state[side] == 'SEEK_PEAK':
+                phase = '山待ち'
+            elif debug['descending'][side]:
+                phase = '谷待ち↓'
+            else:
+                phase = '谷待ち↑'
+            dbg = f"{label}: {phase}  spd={spd:.4f}"
             cv2.putText(display, dbg, (10, 60 + i * 25),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
 
