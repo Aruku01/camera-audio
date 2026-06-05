@@ -2,7 +2,7 @@ import mediapipe as mp
 from flask import Flask, Response, jsonify
 import cv2
 from picamera2 import Picamera2
-from detection import detect, get_status, mp_pose, _state, _ground_y, _air_min_y
+from detection import detect, get_status, mp_pose, _state, _ground_y, _air_min_y, _ground_rx, _max_x_swing
 from audio import play
 from led import flash
 from threading import Thread, Lock
@@ -50,12 +50,15 @@ def _detection_loop():
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
         for i, (side, label) in enumerate([('L', 'Left'), ('R', 'Right')]):
-            gy = _ground_y[side]
-            st = _state[side]
-            gy_str = f"{gy:.2f}" if gy is not None else "--"
-            dbg = f"{label}: {st} gnd={gy_str} air={_air_min_y[side]:.2f}"
+            gy  = _ground_y[side]
+            grx = _ground_rx[side]
+            gy_str  = f"{gy:.2f}"  if gy  is not None else "--"
+            grx_str = f"{grx:.2f}" if grx is not None else "--"
+            dbg = (f"{label}: {_state[side]} "
+                   f"gY={gy_str} airY={_air_min_y[side]:.2f} "
+                   f"gX={grx_str} swg={_max_x_swing[side]:.2f}")
             cv2.putText(display, dbg, (10, 60 + i * 25),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 0), 1)
 
         _, buf = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         with _jpeg_lock:

@@ -5,10 +5,11 @@ import time
 
 mp_pose = mp.solutions.pose
 
-LANDING_COOLDOWN = 0.4   # 同じ足の連続着地防止（秒）
-MIN_LIFT = 0.05          # 着地前にこの量以上足首が上がらないと無効（正規化座標）
-VISIBILITY_MIN = 0.5     # ランドマーク可視性の最低値（これ未満は無視）
-SMOOTH_N = 5             # Y値の平均化フレーム数
+LANDING_COOLDOWN = 0.4
+MIN_Y_LIFT  = 0.04   # Y方向の最小離地量（上昇方向）
+MIN_X_SWING = 0.07   # 股関節基準の足首の最小前後変位
+VISIBILITY_MIN = 0.5
+SMOOTH_N = 5
 
 pose = mp_pose.Pose(
     static_image_mode=False,
@@ -21,16 +22,28 @@ pose = mp_pose.Pose(
 current_status = {"message": "検出待機中..."}
 _lock = Lock()
 
-_y_buf = {'L': deque(maxlen=SMOOTH_N), 'R': deque(maxlen=SMOOTH_N)}
-_state = {'L': 'ground', 'R': 'ground'}  # 'ground' | 'lifted'
-_ground_y = {'L': None, 'R': None}       # 着地時のY値（動的に記録）
-_air_min_y = {'L': 1.0, 'R': 1.0}        # 空中中の最高到達点（最低Y値）
-_last_land_time = {'L': 0.0, 'R': 0.0}
+_y_buf  = {'L': deque(maxlen=SMOOTH_N), 'R': deque(maxlen=SMOOTH_N)}
+_rx_buf = {'L': deque(maxlen=SMOOTH_N), 'R': deque(maxlen=SMOOTH_N)}
+
+_state       = {'L': 'ground', 'R': 'ground'}  # 'ground' | 'moving'
+_ground_y    = {'L': None,     'R': None}
+_ground_rx   = {'L': None,     'R': None}   # 地面時の股関節基準X
+_air_min_y   = {'L': 1.0,      'R': 1.0}
+_max_x_swing = {'L': 0.0,      'R': 0.0}   # 動作中の最大前後変位
+_last_land_time = {'L': 0.0,   'R': 0.0}
+
+_ANKLE_LM = {'L': mp_pose.PoseLandmark.LEFT_ANKLE,  'R': mp_pose.PoseLandmark.RIGHT_ANKLE}
+_HIP_LM   = {'L': mp_pose.PoseLandmark.LEFT_HIP,    'R': mp_pose.PoseLandmark.RIGHT_HIP}
 
 
-def _smooth(side, y):
+def _smooth_y(side, y):
     _y_buf[side].append(y)
     return sum(_y_buf[side]) / len(_y_buf[side])
+
+
+def _smooth_rx(side, rx):
+    _rx_buf[side].append(rx)
+    return sum(_rx_buf[side]) / len(_rx_buf[side])
 
 
 def get_status():
@@ -40,45 +53,62 @@ def get_status():
 
 def detect(frame):
     """
-    「持ち上げてから着地」の状態機械で着地を検出する。
-    カメラブレ（全ランドマークが同方向に微量移動）では
-    MIN_LIFT 分の上昇→下降サイクルが成立しないため誤検知しない。
+    足の離地を「Y上昇」または「股関節基準X前後変位」のいずれかで検出し、
+    Y座標が戻った時点を着地と判定する。
 
     戻り値: (results, message, landed)
-      landed: このフレームで着地した足のリスト ['L'], ['R'], []
+      landed: 着地した足のリスト ['L'], ['R'], []
     """
     results = pose.process(frame)
     landed = []
 
     if results.pose_landmarks:
         lm = results.pose_landmarks.landmark
-        ankles = {
-            'L': lm[mp_pose.PoseLandmark.LEFT_ANKLE],
-            'R': lm[mp_pose.PoseLandmark.RIGHT_ANKLE],
-        }
         now = time.time()
 
-        for side, ankle in ankles.items():
+        for side in ('L', 'R'):
+            ankle = lm[_ANKLE_LM[side]]
+            hip   = lm[_HIP_LM[side]]
+
             if ankle.visibility < VISIBILITY_MIN:
                 continue
 
-            y = _smooth(side, ankle.y)
+            y = _smooth_y(side, ankle.y)
+
+            # 股関節が見えていれば前後変位を使用、見えなければY軸のみ
+            hip_ok = hip.visibility >= VISIBILITY_MIN
+            rx = _smooth_rx(side, ankle.x - hip.x) if hip_ok else (_ground_rx[side] or 0.0)
 
             if _state[side] == 'ground':
                 if _ground_y[side] is None:
                     _ground_y[side] = y
-                # MIN_LIFT 以上上がったら「空中」へ移行
-                if y < _ground_y[side] - MIN_LIFT:
-                    _state[side] = 'lifted'
-                    _air_min_y[side] = y
+                    _ground_rx[side] = rx
 
-            else:  # 'lifted'
+                y_lifted = y < _ground_y[side] - MIN_Y_LIFT
+                x_swung  = abs(rx - (_ground_rx[side] or rx)) > MIN_X_SWING
+
+                if y_lifted or x_swung:
+                    _state[side]       = 'moving'
+                    _air_min_y[side]   = y
+                    _max_x_swing[side] = abs(rx - (_ground_rx[side] or rx))
+
+            else:  # 'moving'
                 if y < _air_min_y[side]:
                     _air_min_y[side] = y
-                # 最高到達点から MIN_LIFT 以上下がったら着地
-                if y > _air_min_y[side] + MIN_LIFT:
-                    _state[side] = 'ground'
-                    _ground_y[side] = y
+                swing = abs(rx - (_ground_rx[side] or rx))
+                if swing > _max_x_swing[side]:
+                    _max_x_swing[side] = swing
+
+                # 着地判定: Yが最高点から戻りつつ、有意な動きがあった
+                y_returning = y > _air_min_y[side] + MIN_Y_LIFT * 0.5
+                had_y_motion = (_ground_y[side] or 0) - _air_min_y[side] >= MIN_Y_LIFT
+                had_x_motion = _max_x_swing[side] >= MIN_X_SWING
+
+                if y_returning and (had_y_motion or had_x_motion):
+                    _state[side]       = 'ground'
+                    _ground_y[side]    = y
+                    _ground_rx[side]   = rx
+                    _max_x_swing[side] = 0.0
                     if now - _last_land_time[side] > LANDING_COOLDOWN:
                         _last_land_time[side] = now
                         landed.append(side)
@@ -89,10 +119,10 @@ def detect(frame):
         else:
             message = "人物検出中"
     else:
-        # 未検出時はベースラインをリセットして次回の再検出に備える
         for side in ('L', 'R'):
-            _ground_y[side] = None
-            _state[side] = 'ground'
+            _ground_y[side]  = None
+            _ground_rx[side] = None
+            _state[side]     = 'ground'
         message = "人物未検出"
 
     with _lock:
