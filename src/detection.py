@@ -51,6 +51,11 @@ _peak_spd     = {'L': 0.0, 'R': 0.0}     # SEEK_VALLEY 中に観測した最大�
 _descending   = {'L': False, 'R': False}  # 速度が下降中か
 _last_contact = {'L': 0.0, 'R': 0.0}
 
+# ── 観察モード ── 速度の実測値確認用。確認後は削除する
+_OBSERVE = True        # False にすれば出力停止
+_OBSERVE_INTERVAL = 0.1
+_last_print = 0.0
+
 # server.py からインポートしてデバッグ表示に使う
 debug = {
     'speed':      {'L': 0.0, 'R': 0.0},
@@ -151,6 +156,18 @@ def detect(frame):
             debug['speed'][side]      = spd
             debug['peak_spd'][side]   = _peak_spd[side]
             debug['descending'][side] = _descending[side]
+
+        # 観察モード: 間引きプリント
+        global _last_print
+        if _OBSERVE and now - _last_print >= _OBSERVE_INTERVAL:
+            _last_print = now
+            for side in ('L', 'R'):
+                label = '左' if side == 'L' else '右'
+                st    = _state[side]
+                sp    = debug['speed'][side]
+                pk    = debug['peak_spd'][side]
+                fire  = '★着地' if side in landed else ''
+                print(f"[{label}] {st:<12}  spd={sp:.4f}  peak={pk:.4f}  {fire}")
 
         if landed:
             label = '・'.join('左足' if s == 'L' else '右足' for s in landed)
