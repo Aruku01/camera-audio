@@ -1,7 +1,9 @@
+import mediapipe as mp
 from flask import Flask, Response, jsonify
 import cv2
 from picamera2 import Picamera2
-from detection import detect, current_status, mp_pose
+from detection import detect, get_status, mp_pose
+from audio import play
 import time
 
 app = Flask(__name__)
@@ -14,16 +16,18 @@ picam2.configure(config)
 picam2.start()
 time.sleep(2)
 
+
 def generate_frames():
     while True:
         frame = picam2.capture_array()
-        results, text = detect(frame)
+        results, text, landed = detect(frame)
 
-        b, g, r = cv2.split(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
-        frame_bgr = cv2.merge([r, g, b])
+        for side in landed:
+            play(side)
+
+        frame_bgr = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
 
         if results.pose_landmarks:
-            import mediapipe as mp
             mp.solutions.drawing_utils.draw_landmarks(
                 frame_bgr,
                 results.pose_landmarks,
@@ -36,6 +40,7 @@ def generate_frames():
         _, buffer = cv2.imencode('.jpg', frame_bgr)
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
+
 
 @app.route('/')
 def index():
@@ -69,15 +74,18 @@ def index():
     </html>
     '''
 
+
 @app.route('/video')
 def video():
     return Response(generate_frames(),
                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
+
 @app.route('/status')
 def status():
-    return jsonify(current_status)
+    return jsonify(get_status())
+
 
 if __name__ == '__main__':
-    print("サーバー起動: http://10.50.27.32:5000")
+    print("サーバー起動: http://localhost:5000")
     app.run(host='0.0.0.0', port=5000, debug=False)

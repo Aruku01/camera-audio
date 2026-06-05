@@ -1,0 +1,5 @@
+flask==2.2.2
+mediapipe==0.10.18
+opencv-python==4.13.0.92
+numpy==1.26.4
+pygame==2.1.2
