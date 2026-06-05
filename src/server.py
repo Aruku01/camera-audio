@@ -2,7 +2,7 @@ import mediapipe as mp
 from flask import Flask, Response, jsonify
 import cv2
 from picamera2 import Picamera2
-from detection import detect, get_status, mp_pose
+from detection import detect, get_status, mp_pose, _state, _ground_y, _air_min_y
 from audio import play
 from led import flash
 import time
@@ -41,6 +41,16 @@ def generate_frames():
 
         cv2.putText(display, text, (10, 30),
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+
+        # デバッグ: 各足首のY値と状態を表示
+        for i, (side, label) in enumerate([('L', 'Left'), ('R', 'Right')]):
+            gy = _ground_y[side]
+            ay = _air_min_y[side]
+            st = _state[side]
+            gy_str = f"{gy:.2f}" if gy is not None else "--"
+            dbg = f"{label}: state={st} gnd={gy_str} air={ay:.2f}"
+            cv2.putText(display, dbg, (10, 60 + i * 25),
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
 
         _, buffer = cv2.imencode('.jpg', display)
         yield (b'--frame\r\n'

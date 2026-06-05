@@ -1,36 +1,36 @@
 import mediapipe as mp
 from threading import Lock
+from collections import deque
 import time
 
 mp_pose = mp.solutions.pose
 
-# 足首Y座標がこの値以上になったら「地面についた」と判定する（正規化座標 0〜1）
-# カメラの高さ・距離・人物の大きさに応じて 0.70〜0.85 の範囲で調整する
-GROUND_Y_THRESHOLD = 0.75
-LANDING_COOLDOWN = 0.35  # 同じ足の連続着地を防ぐ間隔（秒）
+LANDING_COOLDOWN = 0.4   # 同じ足の連続着地防止（秒）
+MIN_LIFT = 0.05          # 着地前にこの量以上足首が上がらないと無効（正規化座標）
+VISIBILITY_MIN = 0.5     # ランドマーク可視性の最低値（これ未満は無視）
+SMOOTH_N = 5             # Y値の平均化フレーム数
 
 pose = mp_pose.Pose(
     static_image_mode=False,
-    model_complexity=1,
+    model_complexity=2,       # 最高精度モデル
     smooth_landmarks=True,
-    min_detection_confidence=0.3,
-    min_tracking_confidence=0.3
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5,
 )
 
 current_status = {"message": "検出待機中..."}
 _lock = Lock()
 
-# 各足が「空中」か「地面」かの状態を保持する
-_ankle_state = {'L': 'ground', 'R': 'ground'}
-_last_landing_time = {'L': 0.0, 'R': 0.0}
+_y_buf = {'L': deque(maxlen=SMOOTH_N), 'R': deque(maxlen=SMOOTH_N)}
+_state = {'L': 'ground', 'R': 'ground'}  # 'ground' | 'lifted'
+_ground_y = {'L': None, 'R': None}       # 着地時のY値（動的に記録）
+_air_min_y = {'L': 1.0, 'R': 1.0}        # 空中中の最高到達点（最低Y値）
+_last_land_time = {'L': 0.0, 'R': 0.0}
 
 
-def _check_landing(side, y):
-    """Y座標が閾値を超えたとき（air→ground）を着地と判定する"""
-    prev = _ankle_state[side]
-    current = 'ground' if y >= GROUND_Y_THRESHOLD else 'air'
-    _ankle_state[side] = current
-    return prev == 'air' and current == 'ground'
+def _smooth(side, y):
+    _y_buf[side].append(y)
+    return sum(_y_buf[side]) / len(_y_buf[side])
 
 
 def get_status():
@@ -40,22 +40,48 @@ def get_status():
 
 def detect(frame):
     """
+    「持ち上げてから着地」の状態機械で着地を検出する。
+    カメラブレ（全ランドマークが同方向に微量移動）では
+    MIN_LIFT 分の上昇→下降サイクルが成立しないため誤検知しない。
+
     戻り値: (results, message, landed)
-      landed: このフレームで着地した足のリスト。例: ['L'], ['R'], []
+      landed: このフレームで着地した足のリスト ['L'], ['R'], []
     """
     results = pose.process(frame)
     landed = []
 
     if results.pose_landmarks:
         lm = results.pose_landmarks.landmark
-        left_ankle = lm[mp_pose.PoseLandmark.LEFT_ANKLE]
-        right_ankle = lm[mp_pose.PoseLandmark.RIGHT_ANKLE]
+        ankles = {
+            'L': lm[mp_pose.PoseLandmark.LEFT_ANKLE],
+            'R': lm[mp_pose.PoseLandmark.RIGHT_ANKLE],
+        }
         now = time.time()
 
-        for side, ankle in [('L', left_ankle), ('R', right_ankle)]:
-            if _check_landing(side, ankle.y) and now - _last_landing_time[side] > LANDING_COOLDOWN:
-                _last_landing_time[side] = now
-                landed.append(side)
+        for side, ankle in ankles.items():
+            if ankle.visibility < VISIBILITY_MIN:
+                continue
+
+            y = _smooth(side, ankle.y)
+
+            if _state[side] == 'ground':
+                if _ground_y[side] is None:
+                    _ground_y[side] = y
+                # MIN_LIFT 以上上がったら「空中」へ移行
+                if y < _ground_y[side] - MIN_LIFT:
+                    _state[side] = 'lifted'
+                    _air_min_y[side] = y
+
+            else:  # 'lifted'
+                if y < _air_min_y[side]:
+                    _air_min_y[side] = y
+                # 最高到達点から MIN_LIFT 以上下がったら着地
+                if y > _air_min_y[side] + MIN_LIFT:
+                    _state[side] = 'ground'
+                    _ground_y[side] = y
+                    if now - _last_land_time[side] > LANDING_COOLDOWN:
+                        _last_land_time[side] = now
+                        landed.append(side)
 
         if landed:
             label = '・'.join('左足' if s == 'L' else '右足' for s in landed)
@@ -63,6 +89,10 @@ def detect(frame):
         else:
             message = "人物検出中"
     else:
+        # 未検出時はベースラインをリセットして次回の再検出に備える
+        for side in ('L', 'R'):
+            _ground_y[side] = None
+            _state[side] = 'ground'
         message = "人物未検出"
 
     with _lock:
