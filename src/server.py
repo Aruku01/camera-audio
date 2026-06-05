@@ -50,14 +50,11 @@ def _detection_loop():
                    cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
         for i, (side, label) in enumerate([('L', 'Left'), ('R', 'Right')]):
-            spd = debug['speed'][side]
-            mf  = debug['move_frames'][side]
-            dbg = f"{label}: {_state[side]}  spd={spd:.4f}  f={mf}"
+            spd  = debug['speed'][side]
+            dist = debug['swing_dist'][side]
+            dbg  = f"{label}: {_state[side]}  spd={spd:.4f}  dist={dist:.3f}"
             cv2.putText(display, dbg, (10, 60 + i * 25),
                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 0), 1)
-        aux_str = f"dist_d={debug['dist_delta']:.4f}  aux={'ON' if debug['walking_aux'] else 'off'}"
-        cv2.putText(display, aux_str, (10, 112),
-                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (150, 150, 255), 1)
 
         _, buf = cv2.imencode('.jpg', display, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
         with _jpeg_lock:
