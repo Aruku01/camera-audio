@@ -1,40 +1,34 @@
-import cv2
 import mediapipe as mp
 
-def main():
-    # MediaPipeの手検出の準備
-    mp_hands = mp.solutions.hands
-    hands = mp_hands.Hands(
-        static_image_mode=True,      # 静止画モード
-        max_num_hands=2,
-        min_detection_confidence=0.3  # 感度を下げる（デフォルトは0.5）
-    )
-    # 先ほど撮影した画像を読み込む
-    image = cv2.imread("test_capture.jpg")
-    
-    if image is None:
-        print("画像が読み込めませんでした")
-        return
+mp_pose = mp.solutions.pose
+STEP_THRESHOLD = 0.1
 
-    print(f"画像読み込み成功: {image.shape}")
+pose = mp_pose.Pose(
+    static_image_mode=False,
+    model_complexity=1,
+    smooth_landmarks=True,
+    min_detection_confidence=0.5,
+    min_tracking_confidence=0.5
+)
 
-    # BGRからRGBに変換（MediaPipeはRGBを使用）
-    image_rgb = cv2.cvtColor(image, cv2.COLOR_BGRA2RGB)
-    # 手の検出
-    results = hands.process(image_rgb)
+current_status = {"message": "検出待機中..."}
 
-    if results.multi_hand_landmarks:
-        print(f"手を検出しました！検出数: {len(results.multi_hand_landmarks)}")
-    
-        # ランドマークの座標を表示
-        for hand_landmarks in results.multi_hand_landmarks:
-            for id, landmark in enumerate(hand_landmarks.landmark):
-                print(f"ランドマーク {id}: x={landmark.x:.2f}, y={landmark.y:.2f}")
+def detect(frame):
+    results = pose.process(frame)
+
+    if results.pose_landmarks:
+        left_ankle = results.pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_ANKLE]
+        right_ankle = results.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_ANKLE]
+        diff = abs(left_ankle.x - right_ankle.x)
+
+        if diff > STEP_THRESHOLD:
+            if left_ankle.x < right_ankle.x:
+                current_status["message"] = f"左足が前 (差: {diff:.2f})"
+            else:
+                current_status["message"] = f"右足が前 (差: {diff:.2f})"
+        else:
+            current_status["message"] = f"両足揃い (差: {diff:.2f})"
     else:
-        print("手が検出されませんでした")
+        current_status["message"] = "人物未検出"
 
-    hands.close()
-
-if __name__ == "__main__":
-    main()
-
+    return results, current_status["message"]

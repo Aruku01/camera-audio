@@ -1,19 +1,10 @@
-from flask import Flask, Response
+from flask import Flask, Response, jsonify
 import cv2
-import mediapipe as mp
 from picamera2 import Picamera2
+from detection import detect, current_status, mp_pose
 import time
 
 app = Flask(__name__)
-
-mp_pose = mp.solutions.pose
-pose = mp_pose.Pose(
-    static_image_mode=False,
-    model_complexity=1,
-    smooth_landmarks=True,
-    min_detection_confidence=0.5,
-    min_tracking_confidence=0.5
-)
 
 picam2 = Picamera2()
 config = picam2.create_preview_configuration(
@@ -23,53 +14,57 @@ picam2.configure(config)
 picam2.start()
 time.sleep(2)
 
-STEP_THRESHOLD = 0.1
-
 def generate_frames():
     while True:
         frame = picam2.capture_array()
-        results = pose.process(frame)
+        results, text = detect(frame)
 
-        # RGBのままJPEGにエンコード
-        frame_draw = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)
-        b, g, r = cv2.split(frame_draw)
+        b, g, r = cv2.split(cv2.cvtColor(frame, cv2.COLOR_RGB2BGR))
         frame_bgr = cv2.merge([r, g, b])
-        
+
         if results.pose_landmarks:
-            # 骨格を描画
+            import mediapipe as mp
             mp.solutions.drawing_utils.draw_landmarks(
                 frame_bgr,
                 results.pose_landmarks,
                 mp_pose.POSE_CONNECTIONS
             )
 
-            left_ankle = results.pose_landmarks.landmark[mp_pose.PoseLandmark.LEFT_ANKLE]
-            right_ankle = results.pose_landmarks.landmark[mp_pose.PoseLandmark.RIGHT_ANKLE]
-            diff = abs(left_ankle.x - right_ankle.x)
-
-            if diff > STEP_THRESHOLD:
-                if left_ankle.x < right_ankle.x:
-                    text = f"左足が前 (差: {diff:.2f})"
-                else:
-                    text = f"右足が前 (差: {diff:.2f})"
-            else:
-                text = f"両足揃い (差: {diff:.2f})"
-
-            cv2.putText(frame_bgr, text, (10, 30),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
+        cv2.putText(frame_bgr, text, (10, 30),
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 0), 2)
 
         _, buffer = cv2.imencode('.jpg', frame_bgr)
-        frame_bytes = buffer.tobytes()
-
         yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+               b'Content-Type: image/jpeg\r\n\r\n' + buffer.tobytes() + b'\r\n')
 
 @app.route('/')
 def index():
     return '''
     <html>
-    <body style="background:#000; display:flex; justify-content:center; align-items:center; height:100vh;">
-        <img src="/video" style="max-width:100%;">
+    <head>
+        <style>
+            body { background:#000; color:#fff; font-family:Arial; margin:0; }
+            .container { display:flex; flex-direction:column; align-items:center; padding:20px; }
+            img { width:640px; border:2px solid #fff; }
+            #status { margin-top:20px; font-size:24px; padding:10px 20px;
+                     background:#222; border-radius:8px; min-width:300px; text-align:center; }
+        </style>
+    </head>
+    <body>
+        <div class="container">
+            <h2>歩行検出システム</h2>
+            <img src="/video">
+            <div id="status">検出待機中...</div>
+        </div>
+        <script>
+            setInterval(() => {
+                fetch('/status')
+                    .then(r => r.json())
+                    .then(data => {
+                        document.getElementById('status').innerText = data.message;
+                    });
+            }, 200);
+        </script>
     </body>
     </html>
     '''
@@ -78,6 +73,10 @@ def index():
 def video():
     return Response(generate_frames(),
                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/status')
+def status():
+    return jsonify(current_status)
 
 if __name__ == '__main__':
     print("サーバー起動: http://10.50.27.32:5000")
