@@ -4,6 +4,7 @@ import cv2
 from picamera2 import Picamera2
 from detection import detect, get_status, mp_pose
 from audio import play
+from led import flash
 import time
 
 app = Flask(__name__)
@@ -27,6 +28,8 @@ def generate_frames():
 
         for side in landed:
             play(side)
+        if landed:
+            flash()
 
         display = frame.copy()
         if results.pose_landmarks:
