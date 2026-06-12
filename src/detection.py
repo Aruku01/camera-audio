@@ -1,22 +1,17 @@
 import mediapipe as mp
 from threading import Lock
 from collections import deque
-import math
 import time
 
 mp_pose = mp.solutions.pose
 
 # ── チューニング定数 ────────────────────────────────────────────────────
-PEAK_MIN         = 0.006  # 「山あり」とみなす最低速度（正規化座標/フレーム）
-                          #   すり足で反応しない場合は 0.004 まで下げる
-VALLEY_THRESH    = 0.003  # この速度を下回ったら谷=接地と即判定
-                          #   PEAK_MIN より低くすること
-VALLEY_DROP_RATIO = 0.5   # 変曲点による谷判定の条件：
-                          #   peak_spd * VALLEY_DROP_RATIO まで下がってから
-                          #   上昇に転じた場合のみ発火（微小なギザギザを無視）
-REFRACTORY_SEC   = 0.5    # 接地イベント後の不応期（秒）
-VISIBILITY_MIN   = 0.5    # ランドマーク可視性の最低値
-SMOOTH_N         = 5      # 速度移動平均フレーム数
+SMOOTH_N       = 5     # 足首Y座標の移動平均フレーム数
+MIN_AMP        = 0.03  # 谷と認める最小振幅（正規化座標）
+                       #   立ち止まり時の微小揺れを除外する
+                       #   すり足で反応しない場合は 0.01 まで下げる
+REFRACTORY_SEC = 0.5   # 接地イベント後の不応期（秒）
+VISIBILITY_MIN = 0.5   # ランドマーク可視性の最低値
 # ────────────────────────────────────────────────────────────────────────
 
 pose = mp_pose.Pose(
@@ -30,62 +25,30 @@ pose = mp_pose.Pose(
 current_status = {"message": "検出待機中..."}
 _lock = Lock()
 
-# 足ごとのランドマーク（足首・かかと・つま先）
-# すり足はつま先が最も動くため3点の最大値を使う
-_FOOT_LM = {
-    'L': (mp_pose.PoseLandmark.LEFT_ANKLE,
-          mp_pose.PoseLandmark.LEFT_HEEL,
-          mp_pose.PoseLandmark.LEFT_FOOT_INDEX),
-    'R': (mp_pose.PoseLandmark.RIGHT_ANKLE,
-          mp_pose.PoseLandmark.RIGHT_HEEL,
-          mp_pose.PoseLandmark.RIGHT_FOOT_INDEX),
+_ANKLE_LM = {
+    'L': mp_pose.PoseLandmark.LEFT_ANKLE,   # 27
+    'R': mp_pose.PoseLandmark.RIGHT_ANKLE,  # 28
 }
 
-_prev_pos     = {side: {lm: None for lm in lms} for side, lms in _FOOT_LM.items()}
-_speed_buf    = {'L': deque(maxlen=SMOOTH_N), 'R': deque(maxlen=SMOOTH_N)}
-
-# 状態: 'SEEK_PEAK'(山待ち) | 'SEEK_VALLEY'(谷待ち)
-_state        = {'L': 'SEEK_PEAK', 'R': 'SEEK_PEAK'}
-_prev_spd     = {'L': 0.0, 'R': 0.0}     # SEEK_VALLEY 中の前フレーム速度
-_peak_spd     = {'L': 0.0, 'R': 0.0}     # SEEK_VALLEY 中に観測した最大速度
-_descending   = {'L': False, 'R': False}  # 速度が下降中か
+_y_buf        = {'L': deque(maxlen=SMOOTH_N), 'R': deque(maxlen=SMOOTH_N)}
+# 状態: 'AWAIT_DESCENT'（下降待ち） | 'IN_DESCENT'（下降中）
+_state        = {'L': 'AWAIT_DESCENT', 'R': 'AWAIT_DESCENT'}
+_prev_y       = {'L': None, 'R': None}
+_local_max_y  = {'L': 0.0, 'R': 0.0}  # 今回の下降が始まった時点のY
+_min_y        = {'L': 1.0, 'R': 1.0}  # 今回の下降中の最小Y
 _last_contact = {'L': 0.0, 'R': 0.0}
-
-# ── 観察モード ── 速度の実測値確認用。確認後は削除する
-_OBSERVE = True        # False にすれば出力停止
-_OBSERVE_INTERVAL = 0.1
-_last_print = 0.0
 
 # server.py からインポートしてデバッグ表示に使う
 debug = {
-    'speed':      {'L': 0.0, 'R': 0.0},
-    'peak_spd':   {'L': 0.0, 'R': 0.0},
-    'descending': {'L': False, 'R': False},
+    'y':     {'L': 0.0, 'R': 0.0},
+    'amp':   {'L': 0.0, 'R': 0.0},
+    'state': {'L': 'AWAIT_DESCENT', 'R': 'AWAIT_DESCENT'},
 }
 
 
-def _foot_speed(side, lm_data):
-    """足首・かかと・つま先のうち最も大きい1フレーム移動量を返す"""
-    max_dist = 0.0
-    for lm_id in _FOOT_LM[side]:
-        lm = lm_data[lm_id]
-        if lm.visibility < VISIBILITY_MIN:
-            continue
-        prev = _prev_pos[side][lm_id]
-        pos = (lm.x, lm.y)
-        if prev is not None:
-            dx = pos[0] - prev[0]
-            dy = pos[1] - prev[1]
-            d = math.sqrt(dx * dx + dy * dy)
-            if d > max_dist:
-                max_dist = d
-        _prev_pos[side][lm_id] = pos
-    return max_dist
-
-
-def _smooth(side, raw):
-    _speed_buf[side].append(raw)
-    return sum(_speed_buf[side]) / len(_speed_buf[side])
+def _smooth_y(side, raw_y):
+    _y_buf[side].append(raw_y)
+    return sum(_y_buf[side]) / len(_y_buf[side])
 
 
 def get_status():
@@ -93,16 +56,28 @@ def get_status():
         return dict(current_status)
 
 
+def reset_state():
+    """人物消失・動画ループ時に呼んで検出状態をクリアする"""
+    for side in ('L', 'R'):
+        _y_buf[side].clear()
+        _state[side]        = 'AWAIT_DESCENT'
+        _prev_y[side]       = None
+        _local_max_y[side]  = 0.0
+        _min_y[side]        = 1.0
+        debug['y'][side]    = 0.0
+        debug['amp'][side]  = 0.0
+        debug['state'][side] = 'AWAIT_DESCENT'
+
+
 def detect(frame):
     """
-    各足の速度が「山→谷」を刻むたびに接地イベントを発火する。
+    足首Y座標の谷（極小点）を接地イベントとして発火する。
 
-      SEEK_PEAK  ─[spd >= PEAK_MIN]────────────────────▶ SEEK_VALLEY
-      SEEK_VALLEY ─[spd < VALLEY_THRESH                 ▶ 接地イベント + SEEK_PEAK
-                    OR (下降後に上昇へ転じた変曲点)]
+    MediaPipe 正規化座標は Y=0 が上端、Y=1 が下端。
+    足が浮くと Y が減少し、地面へ戻ると Y が増加する。
 
-    連続歩行では速度が周期的に山谷を繰り返すため、1歩ごとに発火できる。
-    累積移動量ではなく瞬時速度の変化を見るためリセット漏れが起きない。
+      AWAIT_DESCENT ─[Y が下降開始]──────────────────────────▶ IN_DESCENT
+      IN_DESCENT    ─[Y が上昇に転じ amp >= MIN_AMP]──────────▶ 接地イベント + AWAIT_DESCENT
 
     戻り値: (results, message, landed)
       landed: 今フレームで接地した足のリスト ['L'], ['R'], ['L','R'], []
@@ -115,59 +90,39 @@ def detect(frame):
         now = time.time()
 
         for side in ('L', 'R'):
-            raw = _foot_speed(side, lm)
-            spd = _smooth(side, raw)
+            ankle = lm[_ANKLE_LM[side]]
+            if ankle.visibility < VISIBILITY_MIN:
+                continue
 
-            if _state[side] == 'SEEK_PEAK':
-                if spd >= PEAK_MIN:
-                    _state[side]      = 'SEEK_VALLEY'
-                    _prev_spd[side]   = spd
-                    _peak_spd[side]   = spd
-                    _descending[side] = False
+            y = _smooth_y(side, ankle.y)
+            prev = _prev_y[side]
+            _prev_y[side] = y
 
-            else:  # SEEK_VALLEY
-                # SEEK_VALLEY 中の最大速度を更新
-                if spd > _peak_spd[side]:
-                    _peak_spd[side] = spd
+            if prev is None:
+                continue
 
-                # 速度が前フレームより下がっていたら「下降中」フラグを立てる
-                if spd < _prev_spd[side]:
-                    _descending[side] = True
+            if _state[side] == 'AWAIT_DESCENT':
+                if y < prev:  # Y が減少 = 足が上昇
+                    _local_max_y[side] = prev
+                    _min_y[side] = y
+                    _state[side] = 'IN_DESCENT'
 
-                # 谷の判定（どちらか一方で発火）
-                valley_by_thresh  = spd < VALLEY_THRESH
-                # 変曲点による谷判定：peak_spd の VALLEY_DROP_RATIO 以下まで
-                # 下がってから上昇に転じた場合のみ（微小なギザギザを無視）
-                dropped_enough    = spd <= _peak_spd[side] * VALLEY_DROP_RATIO
-                valley_by_inflect = _descending[side] and dropped_enough and spd > _prev_spd[side]
-
-                if valley_by_thresh or valley_by_inflect:
-                    if now - _last_contact[side] >= REFRACTORY_SEC:
+            else:  # IN_DESCENT
+                if y < _min_y[side]:
+                    _min_y[side] = y
+                if y >= prev:  # 上昇に転じた = 谷を通過
+                    amp = _local_max_y[side] - _min_y[side]
+                    if amp >= MIN_AMP and now - _last_contact[side] >= REFRACTORY_SEC:
                         _last_contact[side] = now
                         landed.append(side)
-                    # 次の山を待つ状態へリセット
-                    _state[side]      = 'SEEK_PEAK'
-                    _prev_spd[side]   = 0.0
-                    _peak_spd[side]   = 0.0
-                    _descending[side] = False
-                else:
-                    _prev_spd[side] = spd
+                    _state[side]       = 'AWAIT_DESCENT'
+                    _local_max_y[side] = 0.0
+                    _min_y[side]       = 1.0
 
-            debug['speed'][side]      = spd
-            debug['peak_spd'][side]   = _peak_spd[side]
-            debug['descending'][side] = _descending[side]
-
-        # 観察モード: 間引きプリント
-        global _last_print
-        if _OBSERVE and now - _last_print >= _OBSERVE_INTERVAL:
-            _last_print = now
-            for side in ('L', 'R'):
-                label = '左' if side == 'L' else '右'
-                st    = _state[side]
-                sp    = debug['speed'][side]
-                pk    = debug['peak_spd'][side]
-                fire  = '★着地' if side in landed else ''
-                print(f"[{label}] {st:<12}  spd={sp:.4f}  peak={pk:.4f}  {fire}")
+            debug['y'][side]    = y
+            debug['amp'][side]  = (_local_max_y[side] - _min_y[side]
+                                   if _state[side] == 'IN_DESCENT' else 0.0)
+            debug['state'][side] = _state[side]
 
         if landed:
             label = '・'.join('左足' if s == 'L' else '右足' for s in landed)
@@ -175,16 +130,7 @@ def detect(frame):
         else:
             message = "人物検出中"
     else:
-        # 再出現時の誤速度を防ぐため前フレーム位置をクリア
-        for side in ('L', 'R'):
-            _prev_pos[side]             = {lm_id: None for lm_id in _FOOT_LM[side]}
-            _state[side]                = 'SEEK_PEAK'
-            _prev_spd[side]             = 0.0
-            _peak_spd[side]             = 0.0
-            _descending[side]           = False
-            debug['speed'][side]        = 0.0
-            debug['peak_spd'][side]     = 0.0
-            debug['descending'][side]   = False
+        reset_state()
         message = "人物未検出"
 
     with _lock:
