@@ -25,7 +25,7 @@ if not isinstance(VIDEO_SOURCE, str):
     picam2.start()
     time.sleep(2)
 
-DETECT_SIZE  = (320, 240)
+DETECT_SIZE  = (640, 480)
 DISPLAY_SIZE = (640, 480)
 JPEG_QUALITY = 70
 
@@ -46,6 +46,8 @@ def _detection_loop():
         print(f"[video] {VIDEO_SOURCE}  {fps:.1f}fps")
     else:
         frame_interval = 0.0
+    _frame_count = 0
+    _last_log    = 0.0
 
     while True:
         t_start = time.time()
@@ -63,6 +65,13 @@ def _detection_loop():
         small = cv2.resize(frame, DETECT_SIZE)
         frame_rgb = cv2.cvtColor(small, cv2.COLOR_BGR2RGB)
         results, text, landed = detect(frame_rgb)
+
+        _frame_count += 1
+        now = time.time()
+        if now - _last_log >= 1.0:
+            person = results.pose_landmarks is not None
+            print(f"[detect] frame={_frame_count}  person={person}")
+            _last_log = now
 
         for side in landed:
             play(side)
